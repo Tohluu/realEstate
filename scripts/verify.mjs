@@ -1,0 +1,76 @@
+// Dependency-free browser checks against a local Chromium debugging session.
+// Start the static server on 4173 and Edge/Chrome with --remote-debugging-port=9222.
+import {mkdir,writeFile} from 'node:fs/promises';
+import assert from 'node:assert/strict';
+
+const targets = await (await fetch('http://127.0.0.1:9222/json/list')).json();
+const target = targets.find(t => t.type === 'page');
+assert(target, 'No test browser page found');
+const socket = new WebSocket(target.webSocketDebuggerUrl);
+await new Promise((resolve,reject) => {socket.onopen=resolve;socket.onerror=reject;});
+let sequence=0;
+const pending=new Map(), errors=[], checks=[];
+socket.onmessage=event=>{const msg=JSON.parse(event.data);if(msg.method==='Runtime.exceptionThrown') errors.push(msg.params.exceptionDetails.text);if(msg.id){const task=pending.get(msg.id);if(task){pending.delete(msg.id);msg.error?task.reject(new Error(JSON.stringify(msg.error))):task.resolve(msg.result);}}};
+const send=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence;pending.set(id,{resolve,reject});socket.send(JSON.stringify({id,method,params}));});
+const evaluate=async expression=>{const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));return r.result?.value;};
+const check=async(name,expression)=>{assert.equal(await evaluate(expression),true,name);checks.push(name);console.log('PASS',name);};
+const navigate=async path=>{await send('Page.navigate',{url:'http://127.0.0.1:4173/'+path});for(let i=0;i<100;i++){if(await evaluate("document.readyState === 'complete'"))break;await new Promise(r=>setTimeout(r,100));}await evaluate("Promise.race([document.fonts.ready,new Promise(r=>setTimeout(r,2000))]).then(()=>true)");};
+const click=selector=>evaluate(`document.querySelector(${JSON.stringify(selector)}).click();true`);
+const fill=(selector,value)=>evaluate(`(()=>{const el=document.querySelector(${JSON.stringify(selector)});el.value=${JSON.stringify(value)};el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return true})()`);
+const capture=async(name,full=false)=>{await evaluate('window.scrollTo({top:0,behavior:"instant"});document.querySelector("#toast")?.classList.remove("visible");true');const layout=await send('Page.getLayoutMetrics');const options={format:'png',captureBeyondViewport:full};if(full)options.clip={x:0,y:0,width:layout.cssContentSize.width,height:layout.cssContentSize.height,scale:1};const r=await send('Page.captureScreenshot',options);await writeFile('artifacts/'+name+'.png',Buffer.from(r.data,'base64'));};
+await mkdir('artifacts',{recursive:true});
+try{
+  await send('Page.enable');await send('Runtime.enable');
+  await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+  await navigate('');
+  await check('Home renders three initial properties',"document.querySelectorAll('.property-card').length === 3");
+  await check('Hero image loads',"document.querySelector('#hero-image').complete && document.querySelector('#hero-image').naturalWidth > 0");
+  await check('All listing images load',"Array.from(document.querySelectorAll('.property-card img')).every(i=>i.complete && i.naturalWidth>0)");
+  await check('Desktop has no horizontal overflow','document.documentElement.scrollWidth <= innerWidth');
+  await capture('desktop');await capture('desktop-full',true);
+  await click('#load-more');await check('Discover more reveals six homes',"document.querySelectorAll('.property-card').length === 6 && document.querySelector('#load-more').hidden");
+  await click('[data-filter="rent"]');await check('Rental filter shows two rentals with annual prices',"document.querySelectorAll('.property-card').length === 2 && [...document.querySelectorAll('.card-price')].every(p=>p.textContent.includes('/ year'))");
+  await click('[data-filter="buy"]');await fill('#sort','price-asc');await check('Sale prices sort from lowest to highest',"[...document.querySelectorAll('.card-price')].map(x=>x.textContent).join('|') === '₦125,000,000|₦185,000,000|₦295,000,000'");
+  await fill('#sort','featured');
+  await click('[data-intent="rent"]');await fill('#location','Lekki Phase 1');await fill('#property-type','Apartment');await fill('#budget','7000000');await click('.search-submit');
+  await check('Combined search returns matching rental',"document.querySelectorAll('.property-card').length === 1 && document.querySelector('.card-title').textContent === 'The Lightwell Apartment' && !document.querySelector('#active-filters').hidden");
+  await fill('#location','Ikoyi');await click('.search-submit');await check('No results displays actionable empty state',"document.querySelectorAll('.property-card').length === 0 && !document.querySelector('#empty-state').hidden");
+  await click('#reset-search');await check('Reset restores default collection',"document.querySelectorAll('.property-card').length === 3 && document.querySelector('#active-filters').hidden");
+  await evaluate("localStorage.removeItem('haven-saved');saved.clear();updateSaved();true");
+  await click('[data-save="courtyard"]');await check('Saving updates accessible state and counter',"document.querySelector('[data-save=courtyard]').getAttribute('aria-pressed') === 'true' && document.querySelector('#saved-count').textContent === '1'");
+  await navigate('');await click('[data-show-saved]');await check('Saved home survives page reload',"document.querySelectorAll('.property-card').length === 1 && document.querySelector('.card-title').textContent === 'The Courtyard House'");
+  await click('[data-save="courtyard"]');await check('Removing last saved home shows empty collection',"document.querySelectorAll('.property-card').length === 0 && !document.querySelector('#empty-state').hidden");
+  await click('[data-filter="all"]');await click('#load-more');
+  for(const id of ['courtyard','park','terrace'])await click(`[data-compare="${id}"]`);
+  await click('[data-compare="garden"]');await check('Comparison enforces three-home maximum',"!document.querySelector('[data-compare=garden]').checked && document.querySelector('#compare-count').textContent === '3 of 3 homes selected'");
+  await click('#open-compare');await check('Comparison dialog distinguishes annual rent and sale price',"document.querySelector('#compare-dialog').open && document.querySelectorAll('.compare-table thead th').length === 4 && document.querySelector('#compare-content').textContent.includes('Annual rent') && document.querySelector('#compare-content').textContent.includes('Sale price')");
+  await capture('comparison');await send('Input.dispatchKeyEvent',{type:'keyDown',key:'Escape',code:'Escape',windowsVirtualKeyCode:27,nativeVirtualKeyCode:27});await send('Input.dispatchKeyEvent',{type:'keyUp',key:'Escape',code:'Escape',windowsVirtualKeyCode:27,nativeVirtualKeyCode:27});await evaluate('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))).then(()=>true)');
+  await check('Escape closes native dialog',"!document.querySelector('#compare-dialog').open");
+  await click('#clear-compare');await check('Clearing comparison resets checkboxes and tray',"document.querySelector('#compare-tray').hidden && [...document.querySelectorAll('[data-compare]')].every(x=>!x.checked)");
+  await click('[data-details="park"]');await check('Property details opens with correct content',"document.querySelector('#detail-dialog').open && document.querySelector('#detail-title').textContent === 'The Parkside Residence'");
+  await click('#plan-property');await check('Property price flows into budget planner',"!document.querySelector('#detail-dialog').open && document.querySelector('#home-price').value === '295000000' && document.querySelector('#monthly-payment').textContent !== '—'");
+  await fill('#home-price','120000000');await fill('#deposit','50');await fill('#loan-term','10');await fill('#interest-rate','0');await check('Zero-interest calculation is correct',"document.querySelector('#monthly-payment').textContent === '₦500,000'");
+  await fill('#interest-rate','12');await check('Amortized payment is correct',"document.querySelector('#monthly-payment').textContent === '₦860,826'");
+  await fill('#home-price','');await check('Invalid calculator input does not show misleading payment',"document.querySelector('#monthly-payment').textContent === '—'");
+  await fill('#home-price','185000000');await fill('#deposit','30');await fill('#loan-term','15');await fill('#interest-rate','18');
+  for(const id of ['first-home','neighbourhood','viewing']){await click(`[data-article="${id}"]`);await check('Article opens: '+id,"document.querySelector('#article-dialog').open && document.querySelectorAll('.article-body h3').length === 4");await click('#article-dialog .dialog-close');}
+  await click('[data-slide="1"]');await check('Featured carousel updates image, title, and selection',"document.querySelector('.hero-property strong').textContent === 'The Parkside Residence' && document.querySelector('[data-slide="+'"1"'+"]').getAttribute('aria-pressed') === 'true' && document.querySelector('#hero-image').src.endsWith('interior.jpg')");
+  await click('[data-slide="0"]');
+  await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await check('390px mobile has no horizontal overflow','document.documentElement.scrollWidth <= innerWidth');
+  await capture('mobile');await capture('mobile-full',true);
+  await click('.menu-toggle');await check('Mobile navigation opens',"document.querySelector('.menu-toggle').getAttribute('aria-expanded') === 'true' && getComputedStyle(document.querySelector('#main-nav')).display !== 'none'");
+  await click('.nav-link');await check('Mobile navigation closes after selection',"document.querySelector('.menu-toggle').getAttribute('aria-expanded') === 'false'");
+  await send('Emulation.setDeviceMetricsOverride',{width:768,height:1024,deviceScaleFactor:1,mobile:false});await check('Tablet has no horizontal overflow','document.documentElement.scrollWidth <= innerWidth');await capture('tablet');
+  await send('Emulation.setDeviceMetricsOverride',{width:320,height:800,deviceScaleFactor:1,mobile:true});await check('320px mobile has no horizontal overflow','document.documentElement.scrollWidth <= innerWidth');await capture('mobile-small');
+  await navigate('subscribe.html');await check('Subscription page loads without shared-script errors',"document.querySelector('#subscribe-form') !== null && document.documentElement.scrollWidth <= innerWidth");
+  await fill('#email','hello@example.com');await click('[name="consent"]');await click('#subscribe-form button');
+  await check('Signup is honest about demo and clears email',"!document.querySelector('#subscribe-message').hidden && document.querySelector('#subscribe-message').textContent.includes('does not send or store') && document.querySelector('#email').value === ''");
+  await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});await capture('subscribe-desktop');
+  await navigate('project.html');await check('Original project URL stays compatible',"document.title.includes('Haven') && document.querySelectorAll('.property-card').length === 3");
+  await evaluate("localStorage.setItem('haven-saved','not-json');true");await navigate('');await check('Corrupt local storage cannot break page',"document.querySelectorAll('.property-card').length === 3 && document.querySelector('#saved-count').textContent === '0'");
+  await evaluate("localStorage.removeItem('haven-saved');true");
+  assert.deepEqual(errors,[],'Unexpected JavaScript runtime errors');checks.push('No JavaScript runtime errors');
+  await writeFile('artifacts/verification.json',JSON.stringify({passed:checks.length,checks,errors},null,2));
+  console.log(`\n${checks.length} checks passed. Screenshots and report saved in artifacts/.`);
+}finally{socket.close();}
